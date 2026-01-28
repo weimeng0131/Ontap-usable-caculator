@@ -1,52 +1,374 @@
-function calcUsableCapacity({
-  mode,                 // "quick" | "accurate"
-  diskCount,            // 盘数
-  diskTB,               // 单盘TB(十进制)
-  raidType,             // "DP" | "TEC"
-  waflReserve = 0.05,   // WAFL预留比例
-  // 精确模式参数
-  rootPartitionGB = 0,  // 每盘root分区(GB, 十进制)
-  dataSpares = 0,       // 数据分区spare数量（例：12盘TEC在Fusion里=1）
-  otherOverhead = 0.0,  // 其他系统开销(用于对齐Fusion/Quote)，如0.023=2.3%
-  tibFactor = 0.91      // TB->TiB折算
-}) {
-  const parityCount = (raidType === "TEC") ? 3 : 2;
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ONTAP 容量快速计算工具（FAS2820）</title>
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",Arial,sans-serif;margin:24px;background:#fff;}
+    .card{max-width:880px;border:1px solid #e5e5e5;border-radius:14px;padding:18px 18px 14px 18px;}
+    .title{font-size:18px;font-weight:800;margin:0 0 6px 0;}
+    .sub{color:#666;font-size:13px;margin:0 0 14px 0;}
+    .badge{display:inline-block;background:#f6f6f6;border:1px solid #e9e9e9;border-radius:999px;padding:6px 10px;font-size:12px;color:#333;margin-bottom:14px;}
+    .grid{display:grid;grid-template-columns:160px 1fr;gap:10px 12px;align-items:center;}
+    label{font-weight:700;}
+    select,input[type="number"]{width:100%;padding:9px 10px;border:1px solid #d6d6d6;border-radius:12px;font-size:14px;}
+    .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+    .out{margin-top:14px;border:1px dashed #d9d9d9;border-radius:14px;padding:12px;background:#fafafa;}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;}
+    .hint{color:#666;font-size:12px;line-height:1.5;margin-top:8px;}
+    .warn{color:#9a5b00;background:#fff7e6;border:1px solid #ffe0a3;padding:8px 10px;border-radius:12px;margin-top:10px;font-size:12px;}
+    .small{font-size:12px;color:#666;}
+    .kpi{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:10px;}
+    .kpi .box{border:1px solid #e6e6e6;border-radius:14px;padding:10px;background:#fff;}
+    .kpi .num{font-size:18px;font-weight:900;margin-top:6px;}
+    .sep{height:1px;background:#eee;margin:14px 0;}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="title">ONTAP 容量快速计算工具（FAS2820）</div>
+    <p class="sub">面向售前快速估算：输出 TB 与 TiB 两种可用容量（单站点）。</p>
+    <div class="badge">以下为单站点可用容量自动计算</div>
 
-  if (diskCount <= parityCount) {
-    return { tb: 0, tib: 0, detail: "盘数不足以组成该RAID" };
+    <div class="grid">
+      <label for="model">型号</label>
+      <select id="model"></select>
+
+      <label for="diskType">磁盘类型</label>
+      <select id="diskType"></select>
+
+      <label for="diskSize">单盘容量</label>
+      <select id="diskSize"></select>
+
+      <label for="raidType">RAID 方式</label>
+      <select id="raidType"></select>
+
+      <label for="diskCount">磁盘数量</label>
+      <select id="diskCount"></select>
+    </div>
+
+    <div class="sep"></div>
+
+    <div class="row2">
+      <div>
+        <label class="small" for="rootPartGB">ADP Root Partition（GB/盘，十进制）</label>
+        <input id="rootPartGB" type="number" step="0.01" min="0" />
+        <div class="hint">默认按 FAS2820（你截图）为 62.35GB/盘。若你后续发现 SSD/SAS 不同，可直接改这里或做成按盘型自动切换。</div>
+      </div>
+      <div>
+        <label class="small" for="sysFactor">系统隐含系数（用于贴近 Fusion/Quote）</label>
+        <input id="sysFactor" type="number" step="0.0001" min="0.90" max="1.00" />
+        <div class="hint">我们从 Fusion 反推：大盘（22T/24T，TEC）约 0.9788；小盘（4T，DP）接近 0.9965。工具会自动给一个推荐值，你也可手动微调。</div>
+      </div>
+    </div>
+
+    <div class="kpi">
+      <div class="box">
+        <div class="small">可用容量（TB，十进制）</div>
+        <div class="num" id="outTB">-</div>
+      </div>
+      <div class="box">
+        <div class="small">可用容量（TiB，二进制）</div>
+        <div class="num" id="outTiB">-</div>
+      </div>
+    </div>
+
+    <div class="out">
+      <div><b>计算明细（快速口径）</b></div>
+      <pre id="detail" class="mono" style="white-space:pre-wrap;margin:8px 0 0 0;"></pre>
+      <div id="warning" class="warn" style="display:none;"></div>
+      <div class="hint">
+        计算模型（与你提供的 Fusion 观察一致的“快速版”）：<br/>
+        1) 单盘先扣 ADP root 分区：dataPartTB = diskTB − rootPartGB/1000<br/>
+        2) 12 盘下数据聚合采用 RAID Size=11：DP=9D+2P，TEC=8D+3P（Spare 不参与 RAID Size）<br/>
+        3) RAID 后可用（TB）= dataCount × dataPartTB<br/>
+        4) 扣 WAFL 预留（默认 5%）：×0.95<br/>
+        5) 转 TiB（按你前面口径）：×0.91<br/>
+        6) 乘系统隐含系数（sysFactor）以贴近 Fusion/Quote
+      </div>
+    </div>
+  </div>
+
+<script>
+  // ========= 配置区（按你的描述固化） =========
+  const CONFIG = {
+    "FAS2820": {
+      diskTypes: {
+        "SSD":  ["960G", "1.92T", "3.84T", "7.68T"],
+        "SAS":  ["1.2T", "1.8T"],
+        "NLSAS":["4T", "10T", "22T", "24T"]
+      },
+      // RAID 规则：按“磁盘类型+容量”约束
+      raidOptions: ({diskType, diskSize}) => {
+        if (diskType === "SSD" || diskType === "SAS") return ["RAID-DP", "RAID-TEC"];
+        if (diskType === "NLSAS") {
+          if (diskSize === "22T" || diskSize === "24T") return ["RAID-TEC"];
+          return ["RAID-DP", "RAID-TEC"]; // 4T、10T
+        }
+        return [];
+      },
+      diskCounts: [12]
+    }
+  };
+
+  // ========= 经验默认值（可手调） =========
+  const DEFAULTS = {
+    rootPartGB: 62.35, // 你截图里看到的值
+    waflReserve: 0.05,
+    tbToTib: 0.91,
+    // 自动推荐的 sysFactor（快速贴近 Fusion 的经验规则）
+    // - 大盘（>=22T）更像 0.9788（你 22T TEC 对齐结果）
+    // - 小盘（<=4T）更像 0.9965（你 4T DP 对齐结果）
+    // - 中盘（10T左右、SSD/SAS）给个中间值 0.99（后续你可用 Fusion 校准再改）
+    recommendSysFactor: ({diskSize, diskType}) => {
+      const tb = sizeToTB(diskSize);
+      if (!Number.isFinite(tb)) return 0.99;
+      // NLSAS 大盘（22/24）更接近 0.9788
+      if (tb >= 22) return 0.9788;
+      // 很小盘（4T）更接近 0.9965
+      if (tb <= 4.01) return 0.9965;
+      // 10T 以及 SSD/SAS 一般介于两者之间：先用 0.99
+      // 你后续用 Fusion/Quote 校准后，可针对每个盘型单独下发一张表
+      if (diskType === "SSD") return 0.99;
+      if (diskType === "SAS") return 0.99;
+      if (diskType === "NLSAS" && tb <= 10.01) return 0.99;
+      return 0.99;
+    }
+  };
+
+  // ========= 工具函数 =========
+  function sizeToTB(sizeStr) {
+    const s = String(sizeStr).trim().toUpperCase();
+    if (s.endsWith("G")) {
+      const v = parseFloat(s.slice(0, -1));
+      return Number.isFinite(v) ? v / 1000 : NaN; // 960G -> 0.96TB
+    }
+    if (s.endsWith("T")) {
+      const v = parseFloat(s.slice(0, -1));
+      return Number.isFinite(v) ? v : NaN;
+    }
+    return NaN;
   }
 
-  // 快速估算：不考虑ADP root分区、不考虑独立spare策略（或你可以保留你原来的逻辑）
-  if (mode === "quick") {
-    const dataDisks = diskCount - parityCount;
-    const raidUsableTB = dataDisks * diskTB;
-    const waflUsableTB = raidUsableTB * (1 - waflReserve);
+  function setOptions(sel, options, placeholder, autoPickFirst=true) {
+    sel.innerHTML = "";
+    const ph = document.createElement("option");
+    ph.value = "";
+    ph.textContent = placeholder;
+    ph.disabled = true;
+    ph.selected = true;
+    sel.appendChild(ph);
+
+    options.forEach(v => {
+      const o = document.createElement("option");
+      o.value = v;
+      o.textContent = v;
+      sel.appendChild(o);
+    });
+
+    if (autoPickFirst && options.length > 0) sel.value = options[0];
+  }
+
+  function fmt(n, digits=2) {
+    if (!Number.isFinite(n)) return "-";
+    return n.toFixed(digits);
+  }
+
+  // ========= 计算逻辑（快速版，与你的 Fusion 观察一致） =========
+  function calcUsable({
+    diskCount, diskSize, raidType,
+    rootPartGB, waflReserve, tbToTib, sysFactor
+  }) {
+    const diskTB = sizeToTB(diskSize);
+
+    // 12盘情况下（你要求：磁盘数量可选为12）
+    // 数据聚合 RAID Size=11：
+    // - DP: 9 Data + 2 Parity
+    // - TEC: 8 Data + 3 Parity
+    const raidSize = 11;
+    const dataCount = (raidType === "RAID-TEC") ? 8 : 9;
+    const parityCount = (raidType === "RAID-TEC") ? 3 : 2;
+
+    // 先扣 root partition（按十进制 TB）
+    const dataPartTB = diskTB - (rootPartGB / 1000);
+
+    // RAID 后可用（TB，十进制）
+    const raidUsableTB = dataCount * dataPartTB;
+
+    // 扣 WAFL
+    const waflTB = raidUsableTB * (1 - waflReserve);
+
+    // 转 TiB（按你的 0.91 口径）
+    const waflTiB = waflTB * tbToTib;
+
+    // 贴近 Fusion/Quote 的系统隐含系数
+    const finalTiB = waflTiB * sysFactor;
+    const finalTB  = waflTB  * sysFactor;
+
     return {
-      tb: waflUsableTB,
-      tib: waflUsableTB * tibFactor,
-      detail: `quick: (${diskCount}-${parityCount})*${diskTB}TB*(1-${waflReserve})`
+      diskTB, dataPartTB, raidSize, dataCount, parityCount,
+      raidUsableTB, waflTB, finalTB, finalTiB
     };
   }
 
-  // 精确（ADP/Fusion口径）：先扣每盘root分区，再做数据分区spare+校验+WAFL+其他开销
-  const dataPartTB = diskTB - (rootPartitionGB / 1000);
-  const aggrPartitions = diskCount - dataSpares;          // 参与聚合的“数据分区”数量
-  const dataPartitions = aggrPartitions - parityCount;    // 真正可用的数据分区数量
+  // ========= DOM =========
+  const elModel = document.getElementById("model");
+  const elDiskType = document.getElementById("diskType");
+  const elDiskSize = document.getElementById("diskSize");
+  const elRaidType = document.getElementById("raidType");
+  const elDiskCount = document.getElementById("diskCount");
+  const elRootPartGB = document.getElementById("rootPartGB");
+  const elSysFactor = document.getElementById("sysFactor");
+  const outTB = document.getElementById("outTB");
+  const outTiB = document.getElementById("outTiB");
+  const detail = document.getElementById("detail");
+  const warning = document.getElementById("warning");
 
-  if (dataPartitions <= 0) {
-    return { tb: 0, tib: 0, detail: "spare/校验设置导致无可用数据分区" };
+  function init() {
+    setOptions(elModel, Object.keys(CONFIG), "请选择型号");
+    elModel.value = "FAS2820";
+
+    setOptions(elDiskType, Object.keys(CONFIG["FAS2820"].diskTypes), "请选择磁盘类型");
+    elDiskType.value = "SSD";
+
+    setOptions(elDiskCount, CONFIG["FAS2820"].diskCounts.map(String), "请选择磁盘数量");
+    elDiskCount.value = "12";
+
+    elRootPartGB.value = String(DEFAULTS.rootPartGB);
+
+    onDiskTypeOrModelChange(true);
   }
 
-  const raidUsableTB = dataPartitions * dataPartTB;
-  const waflUsableTB = raidUsableTB * (1 - waflReserve);
-  const finalUsableTB = waflUsableTB * (1 - otherOverhead);
+  function onDiskTypeOrModelChange(isInit=false) {
+    const model = elModel.value;
+    const diskType = elDiskType.value;
 
-  return {
-    tb: finalUsableTB,
-    tib: finalUsableTB * tibFactor,
-    detail:
-      `accurate: dataPartTB=${dataPartTB.toFixed(4)}TB, ` +
-      `dataPartitions=${dataPartitions}, ` +
-      `* (1-${waflReserve}) * (1-${otherOverhead})`
-  };
-}
+    const sizes = CONFIG[model].diskTypes[diskType] || [];
+    setOptions(elDiskSize, sizes, "请选择单盘容量");
+    // 默认选第一个
+    if (sizes.length > 0) elDiskSize.value = sizes[0];
+
+    onDiskSizeOrRaidRuleChange(isInit);
+  }
+
+  function onDiskSizeOrRaidRuleChange(isInit=false) {
+    const model = elModel.value;
+    const diskType = elDiskType.value;
+    const diskSize = elDiskSize.value;
+
+    const raids = CONFIG[model].raidOptions({diskType, diskSize});
+    setOptions(elRaidType, raids, "请选择 RAID 方式");
+    // 若之前选择不合法，则自动选第一个
+    if (!raids.includes(elRaidType.value)) {
+      if (raids.length > 0) elRaidType.value = raids[0];
+    }
+
+    // 自动推荐 sysFactor（但如果用户手动改过，就不强制覆盖）
+    // 简单判断：如果是初始化或当前值等于上一次推荐值附近，则覆盖
+    const recommended = DEFAULTS.recommendSysFactor({diskSize, diskType});
+    if (isInit || !elSysFactor.dataset.userEdited) {
+      elSysFactor.value = String(recommended);
+      elSysFactor.dataset.lastRecommended = String(recommended);
+    }
+
+    render();
+  }
+
+  function render() {
+    const model = elModel.value;
+    const diskType = elDiskType.value;
+    const diskSize = elDiskSize.value;
+    const raidType = elRaidType.value;
+    const diskCount = parseInt(elDiskCount.value, 10);
+
+    const rootPartGB = parseFloat(elRootPartGB.value);
+    const sysFactor = parseFloat(elSysFactor.value);
+
+    const waflReserve = DEFAULTS.waflReserve;
+    const tbToTib = DEFAULTS.tbToTib;
+
+    // 基础合法性校验
+    const problems = [];
+    if (!model) problems.push("请选择型号");
+    if (!diskType) problems.push("请选择磁盘类型");
+    if (!diskSize) problems.push("请选择单盘容量");
+    if (!raidType) problems.push("请选择 RAID 方式");
+    if (!Number.isFinite(diskCount) || diskCount !== 12) problems.push("磁盘数量仅支持 12");
+    if (!Number.isFinite(rootPartGB) || rootPartGB < 0) problems.push("Root Partition 输入不合法");
+    if (!Number.isFinite(sysFactor) || sysFactor <= 0 || sysFactor > 1) problems.push("系统隐含系数需在 (0,1]");
+
+    // 规则校验：RAID 选择是否允许
+    const allowedRaids = CONFIG[model]?.raidOptions({diskType, diskSize}) || [];
+    if (raidType && allowedRaids.length && !allowedRaids.includes(raidType)) {
+      problems.push(`该组合不支持 ${raidType}，仅支持：${allowedRaids.join(" / ")}`);
+    }
+
+    if (problems.length) {
+      outTB.textContent = "-";
+      outTiB.textContent = "-";
+      detail.textContent = problems.map(p => `- ${p}`).join("\n");
+      warning.style.display = "block";
+      warning.textContent = "请修正以上输入后再计算。";
+      return;
+    }
+
+    const r = calcUsable({
+      diskCount, diskSize, raidType,
+      rootPartGB, waflReserve, tbToTib, sysFactor
+    });
+
+    outTB.textContent = `${fmt(r.finalTB, 2)} TB`;
+    outTiB.textContent = `${fmt(r.finalTiB, 2)} TiB`;
+
+    const diskTB = r.diskTB;
+    const rootTB = rootPartGB / 1000;
+
+    detail.textContent =
+      `型号: ${model}\n` +
+      `磁盘类型: ${diskType}\n` +
+      `单盘容量: ${diskSize} (= ${fmt(diskTB, 4)} TB)\n` +
+      `磁盘数量: ${diskCount}\n` +
+      `RAID: ${raidType}（RAID Size=11；Data=${r.dataCount}, Parity=${r.parityCount}）\n` +
+      `ADP root partition: ${fmt(rootPartGB, 2)} GB/盘 (= ${fmt(rootTB, 5)} TB/盘)\n` +
+      `单盘 data 可用（扣 root 后）: ${fmt(r.dataPartTB, 5)} TB\n` +
+      `RAID 后可用（未扣 WAFL）: ${fmt(r.raidUsableTB, 4)} TB\n` +
+      `WAFL 预留: ${(DEFAULTS.waflReserve*100).toFixed(0)}% -> ${fmt(r.waflTB, 4)} TB\n` +
+      `TB->TiB 折算: ×${DEFAULTS.tbToTib} -> ${fmt(r.waflTB*DEFAULTS.tbToTib, 4)} TiB\n` +
+      `系统隐含系数: ×${fmt(sysFactor, 4)}\n` +
+      `最终可用: ${fmt(r.finalTB, 2)} TB / ${fmt(r.finalTiB, 2)} TiB`;
+
+    // 友好提示：哪些组合是“快速估算更容易有偏差”的
+    const tb = diskTB;
+    let warnText = "";
+    if (diskType === "NLSAS" && (tb >= 22)) {
+      warnText = "提示：22T/24T + RAID-TEC 通常建议以 Fusion/Quote 校准 sysFactor（默认已按 0.9788 贴近你截图的趋势）。";
+    } else if (diskType === "NLSAS" && tb <= 4.01) {
+      warnText = "提示：4T 小盘场景 root/元数据占比更敏感，建议用 Fusion 校准 sysFactor（默认按 0.9965）。";
+    }
+    if (warnText) {
+      warning.style.display = "block";
+      warning.textContent = warnText;
+    } else {
+      warning.style.display = "none";
+      warning.textContent = "";
+    }
+  }
+
+  // ========= 事件绑定 =========
+  elModel.addEventListener("change", () => onDiskTypeOrModelChange(false));
+  elDiskType.addEventListener("change", () => onDiskTypeOrModelChange(false));
+  elDiskSize.addEventListener("change", () => onDiskSizeOrRaidRuleChange(false));
+  elRaidType.addEventListener("change", render);
+  elDiskCount.addEventListener("change", render);
+
+  elRootPartGB.addEventListener("input", render);
+  elSysFactor.addEventListener("input", () => {
+    elSysFactor.dataset.userEdited = "1";
+    render();
+  });
+
+  init();
+</script>
+</body>
+</html>
