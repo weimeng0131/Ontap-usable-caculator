@@ -1,0 +1,52 @@
+function calcUsableCapacity({
+  mode,                 // "quick" | "accurate"
+  diskCount,            // 盘数
+  diskTB,               // 单盘TB(十进制)
+  raidType,             // "DP" | "TEC"
+  waflReserve = 0.05,   // WAFL预留比例
+  // 精确模式参数
+  rootPartitionGB = 0,  // 每盘root分区(GB, 十进制)
+  dataSpares = 0,       // 数据分区spare数量（例：12盘TEC在Fusion里=1）
+  otherOverhead = 0.0,  // 其他系统开销(用于对齐Fusion/Quote)，如0.023=2.3%
+  tibFactor = 0.91      // TB->TiB折算
+}) {
+  const parityCount = (raidType === "TEC") ? 3 : 2;
+
+  if (diskCount <= parityCount) {
+    return { tb: 0, tib: 0, detail: "盘数不足以组成该RAID" };
+  }
+
+  // 快速估算：不考虑ADP root分区、不考虑独立spare策略（或你可以保留你原来的逻辑）
+  if (mode === "quick") {
+    const dataDisks = diskCount - parityCount;
+    const raidUsableTB = dataDisks * diskTB;
+    const waflUsableTB = raidUsableTB * (1 - waflReserve);
+    return {
+      tb: waflUsableTB,
+      tib: waflUsableTB * tibFactor,
+      detail: `quick: (${diskCount}-${parityCount})*${diskTB}TB*(1-${waflReserve})`
+    };
+  }
+
+  // 精确（ADP/Fusion口径）：先扣每盘root分区，再做数据分区spare+校验+WAFL+其他开销
+  const dataPartTB = diskTB - (rootPartitionGB / 1000);
+  const aggrPartitions = diskCount - dataSpares;          // 参与聚合的“数据分区”数量
+  const dataPartitions = aggrPartitions - parityCount;    // 真正可用的数据分区数量
+
+  if (dataPartitions <= 0) {
+    return { tb: 0, tib: 0, detail: "spare/校验设置导致无可用数据分区" };
+  }
+
+  const raidUsableTB = dataPartitions * dataPartTB;
+  const waflUsableTB = raidUsableTB * (1 - waflReserve);
+  const finalUsableTB = waflUsableTB * (1 - otherOverhead);
+
+  return {
+    tb: finalUsableTB,
+    tib: finalUsableTB * tibFactor,
+    detail:
+      `accurate: dataPartTB=${dataPartTB.toFixed(4)}TB, ` +
+      `dataPartitions=${dataPartitions}, ` +
+      `* (1-${waflReserve}) * (1-${otherOverhead})`
+  };
+}
